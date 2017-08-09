@@ -37,6 +37,7 @@ func initRoutesMessages(router *gin.RouterGroup, checkPassword gin.HandlerFunc) 
 	{
 		g.POST("/*topic", messagesCtrl.CreateBulk)
 		g.GET("/*topic", messagesCtrl.List)
+		g.PUT("/*topic", messagesCtrl.UpdateBulk)
 		g.DELETE("/nocascade/*topic", messagesCtrl.DeleteBulk)
 		g.DELETE("/cascade/*topic", messagesCtrl.DeleteBulkCascade)
 		g.DELETE("/cascadeforce/*topic", messagesCtrl.DeleteBulkCascadeForce)

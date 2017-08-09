@@ -367,6 +367,42 @@ func (m *MessagesController) createSingle(ctx *gin.Context, messageIn *tat.Messa
 	return out, http.StatusCreated, nil
 }
 
+func (m *MessagesController) updateObj(ctx *gin.Context, messageIn *tat.MessageJSON, messageReference tat.Message, topic tat.Topic, user tat.User) (*tat.MessageJSONOut, int, string) {
+	if messageIn.Action == "like" || messageIn.Action == "unlike" {
+		return m.likeOrUnlike(messageIn.Action, messageReference, topic, user)
+	}
+
+	isRW, isAdminOnTopic := topicDB.GetUserRights(&topic, &user)
+	if !isRW {
+		return nil, http.StatusForbidden, "No RW Access to topic : " + messageIn.Topic
+	}
+
+	if messageIn.Action == tat.MessageActionLabel || messageIn.Action == tat.MessageActionUnlabel ||
+		messageIn.Action == tat.MessageActionRelabel || messageIn.Action == tat.MessageActionRelabelOrCreate {
+		return m.addOrRemoveLabel(ctx, messageIn, messageReference, user, topic)
+	}
+
+	if messageIn.Action == tat.MessageActionVoteup || messageIn.Action == tat.MessageActionVotedown ||
+		messageIn.Action == tat.MessageActionUnvoteup || messageIn.Action == tat.MessageActionUnvotedown {
+		return m.voteMessage(messageIn, messageReference, user, topic)
+	}
+
+	if messageIn.Action == tat.MessageActionTask || messageIn.Action == tat.MessageActionUntask {
+		return m.addOrRemoveTask(messageIn, messageReference, user, topic)
+	}
+
+	if messageIn.Action == tat.MessageActionUpdate || messageIn.Action == tat.MessageActionConcat {
+		return m.updateMessage(messageIn, messageReference, user, topic, isAdminOnTopic)
+	}
+
+	if messageIn.Action == tat.MessageActionMove {
+		// topic here is fromTopic
+		return m.moveMessage(ctx, messageIn, messageReference, user, topic)
+	}
+
+	return nil, http.StatusBadRequest, "Invalid Action"
+}
+
 // Update a message : like, unlike, add label, etc...
 func (m *MessagesController) Update(ctx *gin.Context) {
 	messageIn := &tat.MessageJSON{}
@@ -376,46 +412,12 @@ func (m *MessagesController) Update(ctx *gin.Context) {
 		return
 	}
 
-	if messageIn.Action == "like" || messageIn.Action == "unlike" {
-		m.likeOrUnlike(ctx, messageIn.Action, messageReference, topic, *user)
-		return
+	out, status, message := m.updateObj(ctx, messageIn, messageReference, topic, *user)
+	if status > 299 {
+		ctx.JSON(status, gin.H{"error": message})
+	} else {
+		ctx.JSON(status, out)
 	}
-
-	isRW, isAdminOnTopic := topicDB.GetUserRights(&topic, user)
-	if !isRW {
-		ctx.AbortWithError(http.StatusForbidden, errors.New("No RW Access to topic : "+messageIn.Topic))
-		return
-	}
-
-	if messageIn.Action == tat.MessageActionLabel || messageIn.Action == tat.MessageActionUnlabel ||
-		messageIn.Action == tat.MessageActionRelabel || messageIn.Action == tat.MessageActionRelabelOrCreate {
-		m.addOrRemoveLabel(ctx, messageIn, messageReference, *user, topic)
-		return
-	}
-
-	if messageIn.Action == tat.MessageActionVoteup || messageIn.Action == tat.MessageActionVotedown ||
-		messageIn.Action == tat.MessageActionUnvoteup || messageIn.Action == tat.MessageActionUnvotedown {
-		m.voteMessage(ctx, messageIn, messageReference, *user, topic)
-		return
-	}
-
-	if messageIn.Action == tat.MessageActionTask || messageIn.Action == tat.MessageActionUntask {
-		m.addOrRemoveTask(ctx, messageIn, messageReference, *user, topic)
-		return
-	}
-
-	if messageIn.Action == tat.MessageActionUpdate || messageIn.Action == tat.MessageActionConcat {
-		m.updateMessage(ctx, messageIn, messageReference, *user, topic, isAdminOnTopic)
-		return
-	}
-
-	if messageIn.Action == tat.MessageActionMove {
-		// topic here is fromTopic
-		m.moveMessage(ctx, messageIn, messageReference, *user, topic)
-		return
-	}
-
-	ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Action"})
 }
 
 // Delete a message
@@ -550,36 +552,32 @@ func (m *MessagesController) checkBeforeDelete(ctx *gin.Context, message tat.Mes
 	return nil
 }
 
-func (m *MessagesController) likeOrUnlike(ctx *gin.Context, action string, message tat.Message, topic tat.Topic, user tat.User) {
+func (m *MessagesController) likeOrUnlike(action string, message tat.Message, topic tat.Topic, user tat.User) (*tat.MessageJSONOut, int, string) {
 
 	info := ""
 	if action == tat.MessageActionLike {
 		if err := messageDB.Like(&message, user, topic); err != nil {
 			log.Errorf("Error while like a message %s", err)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+			return nil, http.StatusInternalServerError, err.Error()
 		}
 		info = "like added"
 	} else if action == tat.MessageActionUnlike {
 		if err := messageDB.Unlike(&message, user, topic); err != nil {
 			log.Errorf("Error while unlike a message %s", err)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+			return nil, http.StatusInternalServerError, err.Error()
 		}
 		info = "like removed"
 	} else {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid action: " + action)})
-		return
+		return nil, http.StatusBadRequest, fmt.Sprintf("Invalid action: " + action)
 	}
 	out := &tat.MessageJSONOut{Info: info, Message: message}
 	hook.SendHook(&tat.HookJSON{HookMessage: &tat.HookMessageJSON{MessageJSONOut: out, Action: action}}, topic)
-	ctx.JSON(http.StatusCreated, out)
+	return out, http.StatusCreated, ""
 }
 
-func (m *MessagesController) addOrRemoveLabel(ctx *gin.Context, messageIn *tat.MessageJSON, message tat.Message, user tat.User, topic tat.Topic) {
+func (m *MessagesController) addOrRemoveLabel(ctx *gin.Context, messageIn *tat.MessageJSON, message tat.Message, user tat.User, topic tat.Topic) (*tat.MessageJSONOut, int, string) {
 	if messageIn.Text == "" && messageIn.Action != tat.MessageActionRelabel {
-		ctx.AbortWithError(http.StatusBadRequest, errors.New("Invalid Text for label"))
-		return
+		return nil, http.StatusBadRequest, "Invalid Text for label"
 	}
 	out := &tat.MessageJSONOut{}
 	if messageIn.Action == tat.MessageActionLabel {
@@ -587,16 +585,14 @@ func (m *MessagesController) addOrRemoveLabel(ctx *gin.Context, messageIn *tat.M
 		if err != nil {
 			errInfo := fmt.Sprintf("Error while adding a label to a message %s", err.Error())
 			log.Errorf(errInfo)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": errInfo})
-			return
+			return nil, http.StatusInternalServerError, errInfo
 		}
 		out = &tat.MessageJSONOut{Info: fmt.Sprintf("label %s added to message", addedLabel.Text), Message: message}
 	} else if messageIn.Action == tat.MessageActionUnlabel {
 		if err := messageDB.RemoveLabel(&message, messageIn.Text, topic); err != nil {
 			errInfo := fmt.Sprintf("Error while removing a label from a message %s", err.Error())
 			log.Errorf(errInfo)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": errInfo})
-			return
+			return nil, http.StatusInternalServerError, errInfo
 		}
 		out = &tat.MessageJSONOut{Info: fmt.Sprintf("label %s removed from message", messageIn.Text), Message: message}
 	} else if messageIn.Action == tat.MessageActionRelabelOrCreate && len(messageIn.Options) == 0 {
@@ -604,8 +600,7 @@ func (m *MessagesController) addOrRemoveLabel(ctx *gin.Context, messageIn *tat.M
 			if err := messageDB.RemoveAllAndAddNewLabel(&message, messageIn.Labels, topic); err != nil {
 				errInfo := fmt.Sprintf("Error while removing all labels and add new ones for a message %s", err.Error())
 				log.Errorf(errInfo)
-				ctx.JSON(http.StatusInternalServerError, gin.H{"error": errInfo})
-				return
+				return nil, http.StatusInternalServerError, errInfo
 			}
 			out = &tat.MessageJSONOut{Info: fmt.Sprintf("all labels removed and new labels %s added to message", messageIn.Text), Message: message}
 		} else {
@@ -614,36 +609,32 @@ func (m *MessagesController) addOrRemoveLabel(ctx *gin.Context, messageIn *tat.M
 			var errCreate error
 			out, code, errCreate = m.createSingle(ctx, messageIn)
 			if errCreate != nil {
-				ctx.JSON(code, gin.H{"error": errCreate})
-				return
+				return nil, code, errCreate.Error()
 			}
 		}
 	} else if messageIn.Action == tat.MessageActionRelabel && len(messageIn.Options) == 0 {
 		if err := messageDB.RemoveAllAndAddNewLabel(&message, messageIn.Labels, topic); err != nil {
 			errInfo := fmt.Sprintf("Error while removing all labels and add new ones for a message %s", err.Error())
 			log.Errorf(errInfo)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": errInfo})
-			return
+			return nil, http.StatusInternalServerError, errInfo
 		}
 		out = &tat.MessageJSONOut{Info: fmt.Sprintf("all labels removed and new labels %s added to message", messageIn.Text), Message: message}
 	} else if messageIn.Action == tat.MessageActionRelabel && len(messageIn.Options) > 0 {
 		if err := messageDB.RemoveSomeAndAddNewLabel(&message, messageIn.Labels, messageIn.Options, topic); err != nil {
 			errInfo := fmt.Sprintf("Error while removing some labels and add new ones for a message %s", err.Error())
 			log.Errorf(errInfo)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": errInfo})
-			return
+			return nil, http.StatusInternalServerError, errInfo
 		}
 		out = &tat.MessageJSONOut{Info: fmt.Sprintf("Some labels removed and new labels %s added to message", messageIn.Text), Message: message}
 
 	} else {
-		ctx.AbortWithError(http.StatusBadRequest, errors.New("Invalid action: "+messageIn.Action))
-		return
+		return nil, http.StatusBadRequest, "Invalid action: " + messageIn.Action
 	}
 	hook.SendHook(&tat.HookJSON{HookMessage: &tat.HookMessageJSON{MessageJSONOut: out, Action: messageIn.Action}}, topic)
-	ctx.JSON(http.StatusCreated, out)
+	return out, http.StatusCreated, ""
 }
 
-func (m *MessagesController) voteMessage(ctx *gin.Context, messageIn *tat.MessageJSON, message tat.Message, user tat.User, topic tat.Topic) {
+func (m *MessagesController) voteMessage(messageIn *tat.MessageJSON, message tat.Message, user tat.User, topic tat.Topic) (*tat.MessageJSONOut, int, string) {
 	info := ""
 	errInfo := ""
 	if messageIn.Action == tat.MessageActionVoteup {
@@ -667,107 +658,93 @@ func (m *MessagesController) voteMessage(ctx *gin.Context, messageIn *tat.Messag
 		}
 		info = "Vote Down removed from message"
 	} else {
-		ctx.AbortWithError(http.StatusBadRequest, errors.New("Invalid action: "+messageIn.Action))
-		return
+		return nil, http.StatusBadRequest, "Invalid action: " + messageIn.Action
 	}
 	if errInfo != "" {
 		log.Errorf(errInfo)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": errInfo})
-		return
+		return nil, http.StatusInternalServerError, errInfo
 	}
 	if err := messageDB.FindByID(&message, messageIn.IDReference, topic); err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Error while fetching message after voting"})
-		return
+		return nil, http.StatusInternalServerError, "Error while fetching message after voting"
 	}
 
 	out := &tat.MessageJSONOut{Info: info, Message: message}
 	hook.SendHook(&tat.HookJSON{HookMessage: &tat.HookMessageJSON{MessageJSONOut: out, Action: messageIn.Action}}, topic)
-	ctx.JSON(http.StatusCreated, out)
+	return out, http.StatusCreated, ""
 }
 
-func (m *MessagesController) addOrRemoveTask(ctx *gin.Context, messageIn *tat.MessageJSON, message tat.Message, user tat.User, topic tat.Topic) {
+func (m *MessagesController) addOrRemoveTask(messageIn *tat.MessageJSON, message tat.Message, user tat.User, topic tat.Topic) (*tat.MessageJSONOut, int, string) {
 	info := ""
 	if messageIn.Action == tat.MessageActionTask {
 		if message.InReplyOfIDRoot != "" {
 			log.Warnf("This message is a reply, you can't task it (%s)", message.ID)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "This message is a reply, you can't task it"})
-			return
+			return nil, http.StatusInternalServerError, "This message is a reply, you can't task it"
 		}
 		if err := messageDB.AddToTasks(&message, user, topic); err != nil {
 			log.Errorf("Error while adding a message to tasks %s", err)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Error while adding a message to tasks"})
-			return
+			return nil, http.StatusInternalServerError, "Error while adding a message to tasks"
 		}
 		info = fmt.Sprintf("New Task created")
 	} else if messageIn.Action == tat.MessageActionUntask {
 		if err := messageDB.RemoveFromTasks(&message, user, topic); err != nil {
 			log.Errorf("Error while removing a message from tasks %s", err)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+			return nil, http.StatusInternalServerError, err.Error()
 		}
 		info = fmt.Sprintf("Task removed")
 	} else {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid action: " + messageIn.Action})
-		return
+		return nil, http.StatusBadRequest, "Invalid action: " + messageIn.Action
 	}
 	out := &tat.MessageJSONOut{Info: info, Message: message}
 	hook.SendHook(&tat.HookJSON{HookMessage: &tat.HookMessageJSON{MessageJSONOut: out, Action: messageIn.Action}}, topic)
-	ctx.JSON(http.StatusCreated, out)
+	return out, http.StatusCreated, ""
 }
 
-func (m *MessagesController) updateMessage(ctx *gin.Context, messageIn *tat.MessageJSON, message tat.Message, user tat.User, topic tat.Topic, isAdminOnTopic bool) {
+func (m *MessagesController) updateMessage(messageIn *tat.MessageJSON, message tat.Message, user tat.User, topic tat.Topic, isAdminOnTopic bool) (*tat.MessageJSONOut, int, string) {
 	var info string
 
 	if isAdminOnTopic && topic.CanUpdateAllMsg {
 		// ok, user is admin on topic, and admin can update all msg
 	} else {
 		if !topic.CanUpdateMsg && !topic.CanUpdateAllMsg {
-			ctx.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("You can't update a message on topic %s", topic.Topic)})
-			return
+			return nil, http.StatusBadRequest, fmt.Sprintf("You can't update a message on topic %s", topic.Topic)
 		}
 
 		if !topic.CanUpdateAllMsg && message.Author.Username != user.Username {
-			ctx.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Could not update a message from another user %s than you %s", message.Author.Username, user.Username)})
-			return
+			return nil, http.StatusBadRequest, fmt.Sprintf("Could not update a message from another user %s than you %s", message.Author.Username, user.Username)
 		}
 	}
 
 	if err := messageDB.Update(&message, user, topic, messageIn.Text, messageIn.Action); err != nil {
 		log.Errorf("Error while update a message %s", err)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return nil, http.StatusInternalServerError, err.Error()
 	}
 	info = fmt.Sprintf("Message updated in %s", topic.Topic)
 	out := &tat.MessageJSONOut{Info: info, Message: message}
 	hook.SendHook(&tat.HookJSON{HookMessage: &tat.HookMessageJSON{MessageJSONOut: out, Action: messageIn.Action}}, topic)
-	ctx.JSON(http.StatusOK, out)
+	return out, http.StatusCreated, ""
 }
 
-func (m *MessagesController) moveMessage(ctx *gin.Context, messageIn *tat.MessageJSON, message tat.Message, user tat.User, fromTopic tat.Topic) {
+func (m *MessagesController) moveMessage(ctx *gin.Context, messageIn *tat.MessageJSON, message tat.Message, user tat.User, fromTopic tat.Topic) (*tat.MessageJSONOut, int, string) {
 
 	// Check if user can delete msg on from topic
 	if err := m.checkBeforeDelete(ctx, message, user, true, fromTopic); err != nil {
 		// ctx writes in checkBeforeDelete
-		return
+		return nil, http.StatusBadRequest, err.Error()
 	}
 
 	toTopic, err := topicDB.FindByTopic(messageIn.Option, true, false, false, &user)
 	if err != nil {
-		e := fmt.Sprintf("Topic destination %s does not exist", messageIn.Option)
-		ctx.JSON(http.StatusNotFound, gin.H{"error": e})
-		return
+		return nil, http.StatusNotFound, fmt.Sprintf("Topic destination %s does not exist", messageIn.Option)
 	}
 
 	// Check if user can write msg from dest topic
 	if isRW, _ := topicDB.GetUserRights(toTopic, &user); !isRW {
-		ctx.JSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("No RW Access to topic %s", toTopic.Topic)})
-		return
+		return nil, http.StatusForbidden, fmt.Sprintf("No RW Access to topic %s", toTopic.Topic)
 	}
 
 	// check if message is a reply -> not possible
 	if message.InReplyOfIDRoot != "" {
-		ctx.JSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("You can't move a reply message")})
-		return
+		return nil, http.StatusForbidden, fmt.Sprintf("You can't move a reply message")
 	}
 
 	info := ""
@@ -775,17 +752,15 @@ func (m *MessagesController) moveMessage(ctx *gin.Context, messageIn *tat.Messag
 		err := messageDB.Move(&message, user, fromTopic, *toTopic)
 		if err != nil {
 			log.Errorf("Error while move a message to topic: %s err: %s", toTopic.Topic, err)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Error while move a message to topic %s", toTopic.Topic)})
-			return
+			return nil, http.StatusInternalServerError, fmt.Sprintf("Error while move a message to topic %s", toTopic.Topic)
 		}
 		info = fmt.Sprintf("Message move to %s", toTopic.Topic)
 	} else {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid action: " + messageIn.Action})
-		return
+		return nil, http.StatusBadRequest, "Invalid action: " + messageIn.Action
 	}
 	out := &tat.MessageJSONOut{Info: info, Message: message}
 	hook.SendHook(&tat.HookJSON{HookMessage: &tat.HookMessageJSON{MessageJSONOut: out, Action: messageIn.Action}}, *toTopic)
-	ctx.JSON(http.StatusCreated, out)
+	return out, http.StatusCreated, ""
 }
 
 func (m *MessagesController) getTopicNameFromAction(username, action string) string {
@@ -884,6 +859,40 @@ func checkTopicParentDM(user tat.User) error {
 		}
 	}
 	return nil
+}
+
+// UpdateBulk updates messages with criterias
+func (m *MessagesController) UpdateBulk(ctx *gin.Context) {
+	out, user, topic, criteria, httpCode, err := m.innerList(ctx)
+	if criteria.TreeView == "" {
+		criteria.TreeView = tat.TreeViewOneTree
+	}
+
+	if err != nil {
+		ctx.JSON(httpCode, gin.H{"error": err.Error()})
+		return
+	}
+
+	messageIn := []tat.MessageJSON{}
+	ctx.Bind(messageIn)
+
+	messages, err := messageDB.ListMessages(criteria, user.Username, topic)
+	if err != nil {
+		ctx.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		return
+	}
+	out.Messages = messages
+	var result []tat.MessageJSONOut
+
+	for index, msg := range out.Messages {
+		out, status, message := m.updateObj(ctx, &messageIn[index], msg, topic, user)
+		if status > 299 {
+			ctx.JSON(status, gin.H{"error": message})
+			return
+		}
+		result = append(result, *out)
+	}
+	ctx.JSON(http.StatusCreated, result)
 }
 
 // DeleteBulkCascade deletes messages and its replies, with criterias
